@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Collaborative Whiteboard</title>
+    <link rel="icon" type="image/x-icon" href="/favicon.png">
+    <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/socket.io@4.7.5/client-dist/socket.io.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .custom-cursor {
+            position: fixed;
+            pointer-events: none;
+            border-radius: 50%;
+            border: 2px solid black;
+            background: rgba(0, 0, 0, 0.2);
+            z-index: 1000;
+            transform: translate(-50%, -50%);
+        }
+        .eraser-cursor {
+            background: rgba(255, 255, 255, 0.5);
+            border: 2px solid red;
+        }
+        .sidebar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 256px;
+            height: 100vh;
+            overflow-y: auto;
+            z-index: 10;
+            background: white;
+        }
+        .canvas-container {
+            margin-left: 256px;
+            flex: 1;
+            position: relative;
+            height: 100vh;
+            padding-top: 64px;
+        }
+        .header {
+            position: fixed;
+            top: 0;
+            left: 256px;
+            right: 0;
+            height: 64px;
+            background: white;
+            z-index: 9;
+            display: flex;
+            align-items: center;
+            padding-left: 16px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+        .modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 20;
+        }
+        .modal-content {
+            background: white;
+            padding: 24px;
+            border-radius: 8px;
+            text-align: center;
+            max-width: 400px;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="text/babel">
+        function App() {
+            const canvasRef = React.useRef(null);
+            const [tool, setTool] = React.useState('freehand');
+            const [roomId, setRoomId] = React.useState('');
+            const [currentRoom, setCurrentRoom] = React.useState('');
+            const [isRoomCreator, setIsRoomCreator] = React.useState(false);
+            const [color, setColor] = React.useState('#000000');
+            const [strokeWidth, setStrokeWidth] = React.useState(2);
+            const [eraserWidth, setEraserWidth] = React.useState(10);
+            const [error, setError] = React.useState('');
+            const [showModal, setShowModal] = React.useState(true);
+            const socket = React.useRef(null);
+            const userId = React.useMemo(() => Math.random().toString(36).substring(2, 15), []);
+            const drawings = React.useRef([]);
+            const currentStroke = React.useRef([]);
+            const drawing = React.useRef(false);
+            const startX = React.useRef(0);
+            const startY = React.useRef(0);
+            const tempShape = React.useRef(null);
+            const cursorRef = React.useRef(null);
+
+            React.useEffect(() => {
+                socket.current = io('http://localhost:3000');
+                const canvas = canvasRef.current;
+                const ctx = canvas.getContext('2d');
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
+
+                const resizeCanvas = () => {
+                    const container = canvas.parentElement;
+                    canvas.width = container.clientWidth - 32; // Padding
+                    canvas.height = window.innerHeight - 64 - 32; // Header + padding
+                    redrawCanvas(ctx);
+                };
+
+                resizeCanvas();
+                window.addEventListener('resize', resizeCanvas);
+
+                socket.current.on('roomCreated', (newRoomId) => {
+                    setRoomId(newRoomId);
+                    setCurrentRoom(`Room: ${newRoomId} (Creator)`);
+                    setIsRoomCreator(true);
+                });
+
+                socket.current.on('error', (msg) => {
+                    setError(msg);
+                    setTimeout(() => setError(''), 3000);
+                });
+
+                socket.current.on('draw', (data) => {
+                    drawings.current.push(data);
+                    drawOnCanvas(ctx, data);
+                });
+
+                socket.current.on('clear', ({ userId: clearerId }) => {
+                    drawings.current = drawings.current.filter(d => d.userId !== clearerId);
+                    redrawCanvas(ctx);
+                });
+
+                socket.current.on('clearAll', () => {
+                    drawings.current = [];
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    redrawCanvas(ctx);
+                });
+
+                socket.current.on('clearStroke', ({ userId: clearerId, strokeId }) => {
+                    drawings.current = drawings.current.filter(d => d.userId !== clearerId || d.strokeId !== strokeId);
+                    redrawCanvas(ctx);
+                });
+
+                const handleMouseMove = (e) => {
+                    if (!cursorRef.current) return;
+                    const rect = canvas.getBoundingClientRect();
+                    const x = e.clientX - rect.left;
+                    const y = e.clientY - rect.top;
+                    const size = tool === 'eraser' || tool === 'strokeEraser' ? eraserWidth : strokeWidth;
+                    cursorRef.current.style.width = `${size}px`;
+                    cursorRef.current.style.height = `${size}px`;
+                    cursorRef.current.style.left = `${e.clientX}px`;
+                    cursorRef.current.style.top = `${e.clientY}px`;
+                };
+
+                window.addEventListener('mousemove', handleMouseMove);
+                return () => {
+                    socket.current.disconnect();
+                    window.removeEventListener('resize', resizeCanvas);
+                    window.removeEventListener('mousemove', handleMouseMove);
+                };
+            }, []);
+
+            const drawOnCanvas = (ctx, data) => {
+                ctx.beginPath();
+                ctx.strokeStyle = data.tool === 'eraser' ? '#ffffff' : data.color;
+                ctx.lineWidth = data.strokeWidth;
+                if (data.tool === 'freehand' || data.tool === 'eraser') {
+                    ctx.moveTo(data.startX, data.startY);
+                    ctx.lineTo(data.endX, data.endY);
+                    ctx.stroke();
+                } else if (data.tool === 'line') {
+                    ctx.moveTo(data.startX, data.startY);
+                    ctx.lineTo(data.endX, data.endY);
+                    ctx.stroke();
+                } else if (data.tool === 'circle') {
+                    const radius = Math.sqrt((data.endX - data.startX) ** 2 + (data.endY - data.startY) ** 2);
+                    ctx.arc(data.startX, data.startY, radius, 0, 2 * Math.PI);
+                    ctx.stroke();
+                } else if (data.tool === 'square') {
+                    const width = data.endX - data.startX;
+                    const height = data.endY - data.startY;
+                    ctx.strokeRect(data.startX, data.startY, width, height);
+                }
+            };
+
+            const redrawCanvas = (ctx) => {
+                ctx.fillStyle = '#ffffff';
+                ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+                drawings.current.forEach(data => drawOnCanvas(ctx, data));
+            };
+
+            const handleMouseDown = (e) => {
+                if (!roomId || showModal) return;
+                const canvas = canvasRef.current;
+                const ctx = canvas.getContext('2d');
+                const rect = canvas.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const y = e.clientY - rect.top;
+                startX.current = x;
+                startY.current = y;
+                drawing.current = true;
+                currentStroke.current = [];
+                if (tool === 'freehand' || tool === 'eraser') {
+                    const drawData = {
+                        roomId,
+                        userId,
+                        tool,
+                        startX: x,
+                        startY: y,
+                        endX: x,
+                        endY: y,
+                        color: tool === 'eraser' ? '#ffffff' : color,
+                        strokeWidth: tool === 'eraser' ? eraserWidth : strokeWidth,
+                        strokeId: Math.random().toString(36).substring(2)
+                    };
+                    currentStroke.current.push(drawData);
+                    socket.current.emit('draw', drawData);
+                } else if (tool === 'strokeEraser') {
+                    const nearestStroke = findNearestStroke(x, y);
+                    if (nearestStroke) {
+                        drawings.current = drawings.current.filter(d => d.strokeId !== nearestStroke);
+                        socket.current.emit('clearStroke', { roomId, userId, strokeId: nearestStroke });
+                        redrawCanvas(ctx);
+                    }
+                }
+            };
+
+            const handleMouseMove = (e) => {
+                if (!drawing.current || !roomId || showModal) return;
+                const canvas = canvasRef.current;
+                const ctx = canvas.getContext('2d');
+                const rect = canvas.getBoundingClientRect();
+                const endX = e.clientX - rect.left;
+                const endY = e.clientY - rect.top;
+
+                if (tool === 'freehand' || tool === 'eraser') {
+                    const drawData = {
+                        roomId,
+                        userId,
+                        tool,
+                        startX: startX.current,
+                        startY: startY.current,
+                        endX,
+                        endY,
+                        color: tool === 'eraser' ? '#ffffff' : color,
+                        strokeWidth: tool === 'eraser' ? eraserWidth : strokeWidth,
+                        strokeId: currentStroke.current[0]?.strokeId
+                    };
+                    socket.current.emit('draw', drawData);
+                    currentStroke.current.push(drawData);
+                    startX.current = endX;
+                    startY.current = endY;
+                } else if (tool !== 'strokeEraser') {
+                    redrawCanvas(ctx);
+                    ctx.beginPath();
+                    ctx.strokeStyle = color;
+                    ctx.lineWidth = strokeWidth;
+                    if (tool === 'line') {
+                        ctx.moveTo(startX.current, startY.current);
+                        ctx.lineTo(endX, endY);
+                        ctx.stroke();
+                    } else if (tool === 'circle') {
+                        const radius = Math.sqrt((endX - startX.current) ** 2 + (endY - startY.current) ** 2);
+                        ctx.arc(startX.current, startY.current, radius, 0, 2 * Math.PI);
+                        ctx.stroke();
+                    } else if (tool === 'square') {
+                        const width = endX - startX.current;
+                        const height = endY - startY.current;
+                        ctx.strokeRect(startX.current, startY.current, width, height);
+                    }
+                    tempShape.current = {
+                        tool,
+                        startX: startX.current,
+                        startY: startY.current,
+                        endX,
+                        endY,
+                        color,
+                        strokeWidth,
+                        strokeId: Math.random().toString(36).substring(2)
+                    };
+                }
+            };
+
+            const handleMouseUp = () => {
+                if (!drawing.current || !roomId) return;
+                drawing.current = false;
+                const canvas = canvasRef.current;
+                const ctx = canvas.getContext('2d');
+                if (tool !== 'freehand' && tool !== 'eraser' && tool !== 'strokeEraser' && tempShape.current) {
+                    socket.current.emit('draw', { ...tempShape.current, roomId, userId });
+                    tempShape.current = null;
+                }
+                currentStroke.current = [];
+            };
+
+            const findNearestStroke = (x, y) => {
+                let nearestStrokeId = null;
+                let minDistance = Infinity;
+                const userDrawings = drawings.current.filter(d => d.userId === userId);
+                const strokeGroups = {};
+                userDrawings.forEach(d => {
+                    if (d.strokeId) {
+                        if (!strokeGroups[d.strokeId]) strokeGroups[d.strokeId] = [];
+                        strokeGroups[d.strokeId].push(d);
+                    }
+                });
+                for (const strokeId in strokeGroups) {
+                    const stroke = strokeGroups[strokeId];
+                    const firstSegment = stroke[0];
+                    let dist = Infinity;
+                    if (firstSegment.tool === 'freehand' || firstSegment.tool === 'eraser') {
+                        for (const segment of stroke) {
+                            dist = Math.min(
+                                dist,
+                                Math.sqrt((x - segment.startX) ** 2 + (y - segment.startY) ** 2),
+                                Math.sqrt((x - segment.endX) ** 2 + (y - segment.endY) ** 2)
+                            );
+                        }
+                    } else if (firstSegment.tool === 'line') {
+                        const { startX, startY, endX, endY } = firstSegment;
+                        dist = pointToLineDistance(x, y, startX, startY, endX, endY);
+                    } else if (firstSegment.tool === 'circle') {
+                        const { startX, startY, endX, endY } = firstSegment;
+                        const radius = Math.sqrt((endX - startX) ** 2 + (endY - startY) ** 2);
+                        const centerDist = Math.sqrt((x - startX) ** 2 + (y - startY) ** 2);
+                        dist = Math.abs(centerDist - radius);
+                    } else if (firstSegment.tool === 'square') {
+                        const { startX, startY, endX, endY } = firstSegment;
+                        const left = Math.min(startX, endX);
+                        const right = Math.max(startX, endX);
+                        const top = Math.min(startY, endY);
+                        const bottom = Math.max(startY, endY);
+                        const dx = Math.max(left - x, 0, x - right);
+                        const dy = Math.max(top - y, 0, y - bottom);
+                        dist = Math.sqrt(dx * dx + dy * dy);
+                    }
+                    const threshold = 30;
+                    if (dist < minDistance && dist < threshold) {
+                        minDistance = dist;
+                        nearestStrokeId = strokeId;
+                    }
+                }
+                return nearestStrokeId;
+            };
+
+            const pointToLineDistance = (px, py, x1, y1, x2, y2) => {
+                const length = Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2);
+                if (length === 0) return Math.sqrt((px - x1) ** 2 + (py - y1) ** 2);
+                const t = Math.max(0, Math.min(1, ((px - x1) * (x2 - x1) + (py - y1) * (y2 - y1)) / (length ** 2)));
+                const projX = x1 + t * (x2 - x1);
+                const projY = y1 + t * (y2 - y1);
+                return Math.sqrt((px - projX) ** 2 + (py - projY) ** 2);
+            };
+
+            const createRoom = () => {
+                socket.current.emit('createRoom', userId);
+            };
+
+            const joinRoom = () => {
+                if (roomId) {
+                    socket.current.emit('joinRoom', { roomId, userId });
+                    setCurrentRoom(`Room: ${roomId}`);
+                } else {
+                    setError('Please enter a Room ID');
+                    setTimeout(() => setError(''), 3000);
+                }
+            };
+
+            const clearCanvas = () => {
+                socket.current.emit('clear', { roomId, userId });
+            };
+
+            const clearAllCanvas = () => {
+                if (isRoomCreator) {
+                    socket.current.emit('clearAll', roomId);
+                }
+            };
+
+            const copyRoomId = () => {
+                navigator.clipboard.writeText(roomId);
+                setError('Room ID copied!');
+                setTimeout(() => setError(''), 2000);
+            };
+
+            const handleModalConfirm = () => {
+                setShowModal(false);
+            };
+
+            return (
+                <div className="min-h-screen bg-gray-100 flex">
+                    <div className="sidebar bg-white shadow-lg p-4 flex flex-col gap-4">
+                        <h2 className="text-xl font-bold text-blue-600">Controls</h2>
+                        <div className="flex flex-col gap-2">
+                            <input
+                                type="text"
+                                value={roomId}
+                                onChange={(e) => setRoomId(e.target.value)}
+                                placeholder="Enter Room ID"
+                                className="p-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            />
+                            <button
+                                onClick={joinRoom}
+                                className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
+                            >
+                                Join Room
+                            </button>
+                            <button
+                                onClick={createRoom}
+                                className="px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600"
+                            >
+                                Create Room
+                            </button>
+                            {roomId && (
+                                <button
+                                    onClick={copyRoomId}
+                                    className="px-4 py-2 bg-gray-500 text-white rounded hover:bg-gray-600"
+                                >
+                                    Copy Room ID
+                                </button>
+                            )}
+                            {currentRoom && <p className="text-gray-700 text-sm">{currentRoom}</p>}
+                        </div>
+                        <hr />
+                        <div className="flex flex-col gap-2">
+                            <button
+                                onClick={() => setTool('freehand')}
+                                className={`px-4 py-2 rounded ${tool === 'freehand' ? 'bg-blue-500 text-white' : 'bg-gray-200'}`}
+                            >
+                                Freehand
+                            </button>
+                            <button
+                                onClick={() => setTool('eraser')}
+                                className={`px-4 py-2 rounded ${tool === 'eraser' ? 'bg-blue-500 text-white' : 'bg-gray-200'}`}
+                            >
+                                Eraser
+                            </button>
+                            <button
+                                onClick={() => setTool('strokeEraser')}
+                                className={`px-4 py-2 rounded ${tool === 'strokeEraser' ? 'bg-blue-500 text-white' : 'bg-gray-200'}`}
+                            >
+                                Stroke Eraser
+                            </button>
+                            <button
+                                onClick={() => setTool('line')}
+                                className={`px-4 py-2 rounded ${tool === 'line' ? 'bg-blue-500 text-white' : 'bg-gray-200'}`}
+                            >
+                                Line
+                            </button>
+                            <button
+                                onClick={() => setTool('circle')}
+                                className={`px-4 py-2 rounded ${tool === 'circle' ? 'bg-blue-500 text-white' : 'bg-gray-200'}`}
+                            >
+                                Circle
+                            </button>
+                            <button
+                                onClick={() => setTool('square')}
+                                className={`px-4 py-2 rounded ${tool === 'square' ? 'bg-blue-500 text-white' : 'bg-gray-200'}`}
+                            >
+                                Rectangle
+                            </button>
+                            <input
+                                type="color"
+                                value={color}
+                                onChange={(e) => { setTool('freehand'); setColor(e.target.value); }}
+                                className="h-10 w-10"
+                            />
+                            <div className="flex flex-col gap-1">
+                                <label className="text-gray-700 text-sm">Draw Width: {strokeWidth}px</label>
+                                <input
+                                    type="range"
+                                    min="1"
+                                    max="20"
+                                    value={strokeWidth}
+                                    onChange={(e) => setStrokeWidth(Number(e.target.value))}
+                                    className="w-full"
+                                />
+                            </div>
+                            <div className="flex flex-col gap-1">
+                                <label className="text-gray-700 text-sm">Eraser Width: {eraserWidth}px</label>
+                                <input
+                                    type="range"
+                                    min="5"
+                                    max="30"
+                                    value={eraserWidth}
+                                    onChange={(e) => setEraserWidth(Number(e.target.value))}
+                                    className="w-full"
+                                />
+                            </div>
+                            <button
+                                onClick={clearCanvas}
+                                className="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600"
+                            >
+                                Clear My Drawings
+                            </button>
+                            <button
+                                onClick={clearAllCanvas}
+                                disabled={!isRoomCreator}
+                                className={`px-4 py-2 rounded ${isRoomCreator ? 'bg-red-700 text-white hover:bg-red-800' : 'bg-gray-300 text-gray-500 cursor-not-allowed'}`}
+                            >
+                                Clear All (Creator Only)
+                            </button>
+                        </div>
+                    </div>
+                    <div className="canvas-container">
+                        <div className="header">
+                            <h1 className="text-2xl font-bold text-blue-600">Collaborative Whiteboard</h1>
+                        </div>
+                        <canvas
+                            ref={canvasRef}
+                            className="border border-gray-300"
+                            onMouseDown={handleMouseDown}
+                            onMouseMove={handleMouseMove}
+                            onMouseUp={handleMouseUp}
+                        />
+                        <div
+                            ref={cursorRef}
+                            className={`custom-cursor ${tool === 'eraser' || tool === 'strokeEraser' ? 'eraser-cursor' : ''}`}
+                            style={{ display: tool ? 'block' : 'none' }}
+                        />
+                        {error && (
+                            <div className="absolute top-4 right-4 bg-red-500 text-white p-2 rounded shadow">
+                                {error}
+                            </div>
+                        )}
+                        {showModal && (
+                            <div className="modal">
+                                <div className="modal-content">
+                                    <p className="text-lg mb-4">First create a room to start drawing</p>
+                                    <button
+                                        onClick={handleModalConfirm}
+                                        className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
+                                    >
+                                        Confirm
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>

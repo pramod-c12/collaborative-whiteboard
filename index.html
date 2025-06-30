@@ -100,7 +100,7 @@
             const cursorRef = React.useRef(null);
 
             React.useEffect(() => {
-                socket.current = io('http://localhost:3000');
+                socket.current = io();
                 const canvas = canvasRef.current;
                 const ctx = canvas.getContext('2d');
                 ctx.lineCap = 'round';
